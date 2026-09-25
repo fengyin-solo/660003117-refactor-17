@@ -35,11 +35,88 @@ interface StateNode {
   epsilonTransitions: number[]
 }
 
-function buildNFA(pattern: string): { states: StateNode[]; startState: number; acceptStates: number[] } {
+// Single parse pass: pattern -> AST. The NFA, match steps and group info
+// all derive from this one tree, so new quantifier/group syntax only needs
+// to be handled here and in buildNFA below.
+export function parseAST(pattern: string): ASTNode {
+  let pos = 0
+  let groupIdx = 0
+
+  function parseAtom(): ASTNode {
+    const ch = pattern[pos]
+    if (ch === '(') {
+      pos++
+      if (pattern[pos] === '?') { pos++; if (pattern[pos] === ':') pos++ }
+      else groupIdx++
+      const node = parseOr()
+      if (pattern[pos] === ')') pos++
+      return { type: 'group', children: [node], groupIndex: groupIdx }
+    }
+    if (ch === '[') {
+      pos++
+      let cls = ''
+      while (pos < pattern.length && pattern[pos] !== ']') { cls += pattern[pos]; pos++ }
+      pos++
+      return { type: 'charclass', value: cls }
+    }
+    if (ch === '.') { pos++; return { type: 'dot' } }
+    if (ch === '\\') {
+      pos++
+      const e = pattern[pos]; pos++
+      if (e === 'd') return { type: 'digit' }
+      if (e === 'w') return { type: 'word' }
+      if (e === 's') return { type: 'space' }
+      return { type: 'char', value: e }
+    }
+    if (ch === '^' || ch === '$') { pos++; return { type: 'anchor', value: ch } }
+    pos++
+    return { type: 'char', value: ch }
+  }
+
+  function parseQuantifier(): ASTNode {
+    let node = parseAtom()
+    while (pos < pattern.length && ['*', '+', '?', '{'].includes(pattern[pos])) {
+      const q = pattern[pos]
+      if (q === '{') {
+        while (pos < pattern.length && pattern[pos] !== '}') pos++
+        pos++
+      } else {
+        pos++
+      }
+      const type = q === '*' ? 'star' : q === '+' ? 'plus' : q === '{' ? 'repeat' : 'question'
+      node = { type, children: [node] }
+      if (pos < pattern.length && pattern[pos] === '?') pos++ // lazy
+    }
+    return node
+  }
+
+  function parseConcat(): ASTNode {
+    const nodes: ASTNode[] = []
+    while (pos < pattern.length && !['|', ')'].includes(pattern[pos])) {
+      nodes.push(parseQuantifier())
+    }
+    if (nodes.length === 1) return nodes[0]
+    return { type: 'concat', children: nodes }
+  }
+
+  function parseOr(): ASTNode {
+    let left = parseConcat()
+    while (pos < pattern.length && pattern[pos] === '|') {
+      pos++
+      const right = parseConcat()
+      left = { type: 'or', children: [left, right] }
+    }
+    return left
+  }
+
+  return parseOr()
+}
+
+// Compile the shared AST into an NFA. States are created in grammar order
+// (concat -> atom -> quantifier -> or) so the graph stays deterministic.
+function buildNFA(ast: ASTNode): { states: StateNode[]; startState: number; acceptStates: number[] } {
   const states: StateNode[] = []
   let stateCounter = 0
-  let pos = 0
-  let groupCount = 0
 
   function newState(): number {
     const id = stateCounter++
@@ -58,21 +135,21 @@ function buildNFA(pattern: string): { states: StateNode[]; startState: number; a
     states[from].epsilonTransitions.push(to)
   }
 
-  function parseCharClass(): (ch: string) => boolean {
-    const negative = pattern[pos] === '^'
-    if (negative) pos++
+  function compileCharClass(cls: string): (ch: string) => boolean {
+    let i = 0
+    const negative = cls[i] === '^'
+    if (negative) i++
     const ranges: [string, string][] = []
     const chars: string[] = []
-    while (pos < pattern.length && pattern[pos] !== ']') {
-      if (pattern[pos + 1] === '-' && pattern[pos + 2] && pattern[pos + 2] !== ']') {
-        ranges.push([pattern[pos], pattern[pos + 2]])
-        pos += 3
+    while (i < cls.length) {
+      if (cls[i + 1] === '-' && cls[i + 2]) {
+        ranges.push([cls[i], cls[i + 2]])
+        i += 3
       } else {
-        chars.push(pattern[pos])
-        pos++
+        chars.push(cls[i])
+        i++
       }
     }
-    pos++ // skip ]
     return (ch: string) => {
       if (negative) {
         return !chars.includes(ch) && !ranges.some(([s, e]) => ch >= s && ch <= e)
@@ -81,98 +158,68 @@ function buildNFA(pattern: string): { states: StateNode[]; startState: number; a
     }
   }
 
-  function parseConcat(): [number, number] {
-    let start = newState()
+  function compileAtom(node: ASTNode): [number, number] {
+    if (node.type === 'group') return compileOr(node.children![0])
+    if (node.type === 'anchor') {
+      const s = newState()
+      return [s, s]
+    }
+    const segStart = newState()
+    const segEnd = newState()
+    if (node.type === 'charclass') {
+      addTransition(segStart, '__class_' + segStart, segEnd)
+      ;(states[segEnd] as any)._matcher = compileCharClass(node.value || '')
+    } else if (node.type === 'dot') {
+      addTransition(segStart, '__dot', segEnd)
+    } else if (node.type === 'digit' || node.type === 'word' || node.type === 'space') {
+      addTransition(segStart, '__' + node.type, segEnd)
+    } else {
+      addTransition(segStart, node.value as string, segEnd)
+    }
+    return [segStart, segEnd]
+  }
+
+  function compileQuantified(node: ASTNode): [number, number] {
+    if (node.type === 'star' || node.type === 'plus' || node.type === 'question' || node.type === 'repeat') {
+      const [segStart, segEnd] = compileQuantified(node.children![0])
+      const qStart = newState()
+      const qEnd = newState()
+      addEpsilon(qStart, segStart)
+      if (node.type === 'star') { addEpsilon(qStart, qEnd); addEpsilon(segEnd, qEnd); addEpsilon(segEnd, segStart) }
+      else if (node.type === 'plus') { addEpsilon(segEnd, qEnd); addEpsilon(segEnd, segStart) }
+      else if (node.type === 'question') { addEpsilon(qStart, qEnd); addEpsilon(segEnd, qEnd) }
+      // 'repeat' ({m,n}) keeps the historical NFA shape: qEnd stays dangling
+      return [qStart, qEnd]
+    }
+    return compileAtom(node)
+  }
+
+  function compileConcat(node: ASTNode): [number, number] {
+    const start = newState()
     let end = start
-    while (pos < pattern.length && !['|', ')'].includes(pattern[pos])) {
-      let segStart: number, segEnd: number
-      const ch = pattern[pos]
-      if (ch === '(') {
-        pos++
-        groupCount++
-        if (pattern[pos] === '?') {
-          pos++
-          if (pattern[pos] === ':') { pos++; }
-          const [s, e] = parseOr()
-          segStart = s; segEnd = e
-        } else {
-          const [s, e] = parseOr()
-          segStart = s; segEnd = e
-        }
-        pos++ // skip )
-      } else if (ch === '[') {
-        pos++
-        segStart = newState()
-        segEnd = newState()
-        const matcher = parseCharClass()
-        addTransition(segStart, '__class_' + segStart, segEnd)
-        ;(states[segEnd] as any)._matcher = matcher
-      } else if (ch === '.') {
-        segStart = newState()
-        segEnd = newState()
-        addTransition(segStart, '__dot', segEnd)
-        pos++
-      } else if (ch === '\\') {
-        pos++
-        const escaped = pattern[pos]
-        segStart = newState()
-        segEnd = newState()
-        if (escaped === 'd') addTransition(segStart, '__digit', segEnd)
-        else if (escaped === 'w') addTransition(segStart, '__word', segEnd)
-        else if (escaped === 's') addTransition(segStart, '__space', segEnd)
-        else addTransition(segStart, escaped, segEnd)
-        pos++
-      } else if (ch === '^' || ch === '$') {
-        segStart = newState()
-        segEnd = segStart
-        pos++
-      } else {
-        segStart = newState()
-        segEnd = newState()
-        addTransition(segStart, ch, segEnd)
-        pos++
-      }
-
-      // Handle quantifiers
-      while (pos < pattern.length && ['*', '+', '?', '{'].includes(pattern[pos])) {
-        const q = pattern[pos]
-        if (q === '{') {
-          while (pos < pattern.length && pattern[pos] !== '}') pos++
-          pos++
-        } else {
-          pos++
-        }
-        const qStart = newState()
-        const qEnd = newState()
-        addEpsilon(qStart, segStart)
-        if (q === '*') { addEpsilon(qStart, qEnd); addEpsilon(segEnd, qEnd); addEpsilon(segEnd, segStart) }
-        else if (q === '+') { addEpsilon(segEnd, qEnd); addEpsilon(segEnd, segStart) }
-        else if (q === '?') { addEpsilon(qStart, qEnd); addEpsilon(segEnd, qEnd) }
-        segStart = qStart; segEnd = qEnd
-        if (pos < pattern.length && pattern[pos] === '?') pos++ // lazy
-      }
-
+    const items = node.type === 'concat' ? node.children! : [node]
+    for (const item of items) {
+      const [segStart, segEnd] = compileQuantified(item)
       if (end !== segStart) addEpsilon(end, segStart)
       end = segEnd
     }
     return [start, end]
   }
 
-  function parseOr(): [number, number] {
-    const [s1, e1] = parseConcat()
-    let start = s1, end = e1
-    while (pos < pattern.length && pattern[pos] === '|') {
-      pos++
-      const [s2, e2] = parseConcat()
-      const ns = newState(), ne = newState()
-      addEpsilon(ns, start); addEpsilon(ns, s2)
-      addEpsilon(end, ne); addEpsilon(e2, ne)
-      start = ns; end = ne
-    }
-    return [start, end]
+  function compileOr(node: ASTNode): [number, number] {
+    if (node.type !== 'or') return compileConcat(node)
+    const [start, end] = compileOr(node.children![0])
+    const [s2, e2] = compileConcat(node.children![1])
+    const ns = newState()
+    const ne = newState()
+    addEpsilon(ns, start)
+    addEpsilon(ns, s2)
+    addEpsilon(end, ne)
+    addEpsilon(e2, ne)
+    return [ns, ne]
   }
 
-  const [startState, acceptState] = parseOr()
+  const [startState, acceptState] = compileOr(ast)
   states[acceptState].isAccept = true
   return { states, startState, acceptStates: [acceptState] }
 }
@@ -317,80 +364,6 @@ export function computeNFA(nfaResult: ReturnType<typeof buildNFA>): NFA {
   return { states: nodes, transitions, startState: nfaResult.startState, acceptStates: nfaResult.acceptStates }
 }
 
-export function parseAST(pattern: string): ASTNode {
-  let pos = 0
-  let groupIdx = 0
-
-  function parseAtom(): ASTNode {
-    const ch = pattern[pos]
-    if (ch === '(') {
-      pos++
-      if (pattern[pos] === '?') { pos++; if (pattern[pos] === ':') pos++ }
-      else groupIdx++
-      const node = parseOr()
-      if (pattern[pos] === ')') pos++
-      return { type: 'group', children: [node], groupIndex: groupIdx }
-    }
-    if (ch === '[') {
-      pos++
-      let cls = ''
-      while (pos < pattern.length && pattern[pos] !== ']') { cls += pattern[pos]; pos++ }
-      pos++
-      return { type: 'charclass', value: cls }
-    }
-    if (ch === '.') { pos++; return { type: 'dot' } }
-    if (ch === '\\') {
-      pos++
-      const e = pattern[pos]; pos++
-      if (e === 'd') return { type: 'digit' }
-      if (e === 'w') return { type: 'word' }
-      if (e === 's') return { type: 'space' }
-      return { type: 'char', value: e }
-    }
-    if (ch === '^' || ch === '$') { pos++; return { type: 'anchor', value: ch } }
-    pos++
-    return { type: 'char', value: ch }
-  }
-
-  function parseQuantifier(): ASTNode {
-    let node = parseAtom()
-    while (pos < pattern.length && ['*', '+', '?', '{'].includes(pattern[pos])) {
-      const q = pattern[pos]
-      if (q === '{') {
-        while (pos < pattern.length && pattern[pos] !== '}') pos++
-        pos++
-      } else {
-        pos++
-      }
-      const type = q === '*' ? 'star' : q === '+' ? 'plus' : 'question'
-      node = { type, children: [node] }
-      if (pos < pattern.length && pattern[pos] === '?') pos++
-    }
-    return node
-  }
-
-  function parseConcat(): ASTNode {
-    const nodes: ASTNode[] = []
-    while (pos < pattern.length && !['|', ')'].includes(pattern[pos])) {
-      nodes.push(parseQuantifier())
-    }
-    if (nodes.length === 1) return nodes[0]
-    return { type: 'concat', children: nodes }
-  }
-
-  function parseOr(): ASTNode {
-    let left = parseConcat()
-    while (pos < pattern.length && pattern[pos] === '|') {
-      pos++
-      const right = parseConcat()
-      left = { type: 'or', children: [left, right] }
-    }
-    return left
-  }
-
-  return parseOr()
-}
-
 export const useRegexStore = defineStore('regex', () => {
   const pattern = ref('^([a-zA-Z0-9._%+-]+)@([a-zA-Z0-9.-]+)\\.([a-zA-Z]{2,})$')
   const testString = ref('user@example.com admin@mail.org invalid-email')
@@ -419,10 +392,11 @@ export const useRegexStore = defineStore('regex', () => {
   function execute() {
     error.value = ''
     try {
-      const built = buildNFA(pattern.value)
+      const tree = parseAST(pattern.value)
+      const built = buildNFA(tree)
       nfa.value = computeNFA(built)
       matchResult.value = runMatch(built.states, built.startState, testString.value)
-      ast.value = parseAST(pattern.value)
+      ast.value = tree
       currentStep.value = 0
     } catch (e: any) {
       error.value = e.message || '正则表达式解析错误'
